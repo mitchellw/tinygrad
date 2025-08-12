@@ -170,12 +170,13 @@ class Linear:
   print(t.numpy())
   ```
   """
-  def __init__(self, in_features:int, out_features:int, bias=True):
+  def __init__(self, in_features:int, out_features:int, bias=True, dtype=dtypes.default_float, math_dtype=dtypes.default_float):
     bound = 1 / math.sqrt(in_features)
-    self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound)
-    self.bias = Tensor.uniform(out_features, low=-bound, high=bound) if bias else None
+    self.math_dtype = math_dtype
+    self.weight = Tensor.uniform(out_features, in_features, low=-bound, high=bound, dtype=dtype)
+    self.bias = Tensor.uniform(out_features, low=-bound, high=bound, dtype=dtype) if bias else None
 
-  def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
+  def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias, self.math_dtype).cast(x.dtype)
 
 class GroupNorm:
   """
@@ -294,15 +295,16 @@ class RMSNorm:
   print(norm(t).numpy())
   ```
   """
-  def __init__(self, dim:int, eps=1e-6, elementwise_affine=True):
+  def __init__(self, dim:int, eps=1e-6, elementwise_affine=True, dtype=dtypes.default_float):
     self.eps = eps
-    self.weight = Tensor.ones(dim) if elementwise_affine else None
+    self.weight = Tensor.ones(dim, dtype=dtype) if elementwise_affine else None
 
   def _norm(self, x:Tensor) -> Tensor: return x * (x.square().mean(-1, keepdim=True) + self.eps).rsqrt()
 
   def __call__(self, x:Tensor) -> Tensor:
-    x = self._norm(x.float()).cast(x.dtype)
-    return x if self.weight is None else x * self.weight
+    original_dtype = x.dtype
+    x = self._norm(x.float())
+    return (x if self.weight is None else x * self.weight).cast(original_dtype)
 
 class Embedding:
   """
@@ -315,8 +317,8 @@ class Embedding:
   print(emb(Tensor([1, 2, 3, 1])).numpy())
   ```
   """
-  def __init__(self, vocab_size:int, embed_size:int):
-    self.vocab_sz, self.embed_sz, self.weight = vocab_size, embed_size, Tensor.glorot_uniform(vocab_size, embed_size)
+  def __init__(self, vocab_size:int, embed_size:int, dtype=dtypes.default_float):
+    self.vocab_sz, self.embed_sz, self.weight = vocab_size, embed_size, Tensor.glorot_uniform(vocab_size, embed_size, dtype=dtype)
 
   def __call__(self, idx:Tensor) -> Tensor:
     if not hasattr(self, 'arange'): self.arange = Tensor.arange(self.vocab_sz, requires_grad=False, device=self.weight.device).unsqueeze(-1)

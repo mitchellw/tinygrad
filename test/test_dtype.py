@@ -4,12 +4,12 @@ import torch
 from typing import Any, List
 from tinygrad.device import is_dtype_supported
 from tinygrad.helpers import getenv, DEBUG, CI
-from tinygrad.dtype import DType, DTYPES_DICT, least_upper_dtype, fp8_to_float, float_to_fp8
+from tinygrad.dtype import DType, DTYPES_DICT, least_upper_dtype, fp8_to_float, float_to_fp8, fp4_to_float, float_to_fp4
 from tinygrad import Device, Tensor, dtypes
 from tinygrad.tensor import _to_np_dtype
 from hypothesis import assume, given, settings, strategies as strat
 from test.helpers import rand_for_dtype
-from test.unit.test_dtype_spec import _assert_eq, core_dtypes, dtype_ints, dtype_floats, FP8E4M3_MAX, FP8E5M2_MAX
+from test.unit.test_dtype_spec import _assert_eq, core_dtypes, dtype_ints, dtype_floats, FP8E4M3_MAX, FP8E5M2_MAX, FP4E2M1_MAX, FP4E2M1_MAX
 import ml_dtypes
 import pytest
 pytestmark = pytest.mark.filterwarnings("ignore")
@@ -108,7 +108,7 @@ class TestDType(unittest.TestCase):
     fields = dtypes.fields()
     self.assertIn("float", fields)
     self.assertIn("float32", fields)
-    self.assertEqual(len(fields), 26)
+    self.assertEqual(len(fields), 27)
     self.assertTrue(all(isinstance(value, DType) for value in fields.values()))
     self.assertTrue(all(issubclass(_to_np_dtype(value), np.generic) for value in fields.values() if _to_np_dtype(value) is not None))
 
@@ -140,6 +140,28 @@ def _test_ops(a_dtype:DType, b_dtype:DType, target_dtype=None):
   _assert_eq(Tensor([1,2,3,4], dtype=a_dtype)*Tensor([1,2,3,4], dtype=b_dtype), target_dtype, [1,4,9,16])
   _assert_eq(Tensor([[1,2],[3,4]], dtype=a_dtype)@Tensor.eye(2, dtype=b_dtype), target_dtype, [[1,2],[3,4]])
   _assert_eq(Tensor([1,1,1,1], dtype=a_dtype)+Tensor.ones((4,4), dtype=b_dtype), target_dtype, 2*Tensor.ones(4,4).numpy())
+
+class TestFp4s(unittest.TestCase):
+  def test_fp4e2m1_creation(self): assert Tensor([-1, 1, 2], dtype=dtypes.fp4e2m1).dtype == dtypes.fp4e2m1
+
+class TestFp4sConversions(unittest.TestCase):
+  @given(strat.floats(width=32, allow_subnormal=True, allow_nan=False, allow_infinity=False, min_value=-FP4E2M1_MAX, max_value=FP4E2M1_MAX))
+  def test_float_to_fp4e2m1(self, x): np.testing.assert_equal(float_to_fp4(x, dtypes.fp4e2m1), ml_dtypes.float4_e2m1fn(x).tobytes()[0])
+
+  def test_float_to_fp4e2m1(self):
+    # TODO: Fill in right values
+    np.testing.assert_equal(float_to_fp4(FP4E2M1_MAX, dtypes.fp4e2m1), 126)
+    np.testing.assert_equal(float_to_fp4(FP4E2M1_MAX*1.01, dtypes.fp4e2m1), 126)
+    np.testing.assert_equal(float_to_fp4(math.inf, dtypes.fp4e2m1), 126)
+    np.testing.assert_equal(float_to_fp4(-FP4E2M1_MAX, dtypes.fp4e2m1), 254)
+    np.testing.assert_equal(float_to_fp4(-FP4E2M1_MAX*1.01, dtypes.fp4e2m1), 254)
+    np.testing.assert_equal(float_to_fp4(-math.inf, dtypes.fp4e2m1), 254)
+    np.testing.assert_equal(float_to_fp4(math.nan, dtypes.fp4e2m1), 127)
+    np.testing.assert_equal(float_to_fp4(-math.nan, dtypes.fp4e2m1), 255)
+
+  # TODO: May want to only do 4 bits, but this might just work (and do many unnecessary tests)
+  @given(strat.integers(min_value=0, max_value=255))
+  def test_fp4e2m1_to_float(self, x): np.testing.assert_equal(fp4_to_float(x, dtypes.fp4e2m1), np.uint8(x).view(ml_dtypes.float4_e2m1fn).item())
 
 class TestFp8s(unittest.TestCase):
   def test_fp8e4m3_creation(self): assert Tensor([-1, 1, 2], dtype=dtypes.fp8e4m3).dtype == dtypes.fp8e4m3

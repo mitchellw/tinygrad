@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Final, ClassVar, Callable, Literal
+import enum
 import math, struct, ctypes, functools
 from dataclasses import dataclass, fields
 from tinygrad.helpers import getenv, prod
@@ -125,7 +126,7 @@ class dtypes:
     """(exponent, mantissa)"""
     if not dtypes.is_float(dtype): raise ValueError(f"{dtype} is not a floating point type")
     return {dtypes.float16: (5, 10), dtypes.bfloat16: (8, 7), dtypes.float32: (8, 23), dtypes.float64: (11, 52),
-            dtypes.fp8e5m2: (5, 2), dtypes.fp8e4m3: (4, 3)}[dtype]
+            dtypes.fp8e5m2: (5, 2), dtypes.fp8e4m3: (4, 3), dtypes.fp4e2m1: (2, 1)}[dtype]
   @staticmethod
   def fields() -> dict[str, DType]: return DTYPES_DICT
   void: Final[DType] = DType.new(-1, 0, "void", None)
@@ -138,13 +139,15 @@ class dtypes:
   uint32: Final[DType] = DType.new(6, 4, "unsigned int", 'I')
   int64: Final[DType] = DType.new(7, 8, "long", 'q')
   uint64: Final[DType] = DType.new(8, 8, "unsigned long", 'Q')
-  fp8e4m3: Final[DType] = DType.new(9, 1, "float8_e4m3", None)
-  fp8e5m2: Final[DType] = DType.new(10, 1, "float8_e5m2", None)
-  float16: Final[DType] = DType.new(11, 2, "half", 'e')
+  # TODO: Support nvfp4 and mxfp4 here instead of the base fp4e2m1?
+  fp4e2m1: Final[DType] = DType.new(10, 1, "float4_fp4e2m1", None)
+  fp8e4m3: Final[DType] = DType.new(11, 1, "float8_e4m3", None)
+  fp8e5m2: Final[DType] = DType.new(12, 1, "float8_e5m2", None)
+  float16: Final[DType] = DType.new(13, 2, "half", 'e')
   # bfloat16 has higher priority than float16, so least_upper_dtype(dtypes.int64, dtypes.uint64) = dtypes.float16
-  bfloat16: Final[DType] = DType.new(12, 2, "__bf16", None)
-  float32: Final[DType] = DType.new(13, 4, "float", 'f')
-  float64: Final[DType] = DType.new(14, 8, "double", 'd')
+  bfloat16: Final[DType] = DType.new(14, 2, "__bf16", None)
+  float32: Final[DType] = DType.new(15, 4, "float", 'f')
+  float64: Final[DType] = DType.new(16, 8, "double", 'd')
 
   # dtype aliases
   half = float16; float = float32; double = float64 # noqa: E702
@@ -160,8 +163,9 @@ class dtypes:
   default_float: ClassVar[DType] = float32
   default_int: ClassVar[DType] = int32
 
+  fp4s = (fp4e2m1,)
   fp8s = (fp8e4m3, fp8e5m2)
-  floats = fp8s + (float16, bfloat16, float32, float64)
+  floats = fp4s + fp8s + (float16, bfloat16, float32, float64)
   uints = (uint8, uint16, uint32, uint64)
   sints = (int8, int16, int32, int64)
   ints = uints + sints
@@ -176,9 +180,16 @@ def to_dtype(dtype:DTypeLike) -> DType: return dtype if isinstance(dtype, DType)
 
 # https://jax.readthedocs.io/en/latest/jep/9407-type-promotion.html
 # we don't support weak type and complex type
+
+class RoundingMode(enum.Enum):
+    """Rounding mode for fp4"""
+    NEAREST = 0
+    TOWARDS_ZERO = 1
+
 promo_lattice = { dtypes.bool: [dtypes.int8, dtypes.uint8], dtypes.int8: [dtypes.int16], dtypes.int16: [dtypes.int32], dtypes.int32: [dtypes.int64],
   dtypes.int64: [dtypes.float16, dtypes.bfloat16], dtypes.uint8: [dtypes.int16, dtypes.uint16], dtypes.uint16: [dtypes.int32, dtypes.uint32],
   dtypes.uint32: [dtypes.int64, dtypes.uint64], dtypes.uint64: [dtypes.float16, dtypes.bfloat16],
+  dtypes.fp4e2m1: [dtypes.fp8e4m3, dtypes.fp8e4m3],
   dtypes.fp8e5m2: [dtypes.float16, dtypes.bfloat16], dtypes.fp8e4m3: [dtypes.float16, dtypes.bfloat16],
   dtypes.float16: [dtypes.float32], dtypes.bfloat16: [dtypes.float32], dtypes.float32: [dtypes.float64], }
 
@@ -287,9 +298,118 @@ def fp8_to_float(x: int, dtype: DType) -> float:
   float32_val = struct.unpack('e', half_bytes)[0]
   return float(float32_val)
 
+
+# fp4-float conversions based on fp8 conversion function and https://gitlab.com/nvidia/headers/cuda-individual/cudart/-/blob/main/cuda_fp4.hpp
+def float_to_fp4(x: float, dtype: DType, rounding: RoundingMode) -> int:
+  assert dtype in dtypes.fp4s, "Only for fp4s"
+  DP_INF_BITS = 0x7FF0000000000000
+  config = {
+      dtypes.fp4e2m1: {"EXP_BIAS": 1, "SIGNIFICAND_BITS": 2, "MANTISSA_MASK": 0x1, "MINDENORM_O2": 0x3FD0000000000000,
+              "OVERFLOW_THRESHOLD": 0x4018000000000000, "MAXNORM": 0x7, "MINNORM": 0x3FF0000000000000, "INF_VALUE": 0x7}
+  }[dtype]
+  xbits, = struct.unpack('Q', struct.pack('d', x))
+  FP4_DP_HALF_ULP = 1 << (53 - config["SIGNIFICAND_BITS"] - 1)
+  sign = ((xbits >> 63) & 1) << 3
+  exp = (((xbits >> 52) & 0x7FF) - 1023 + config["EXP_BIAS"])
+  mantissa = (xbits >> (53 - config["SIGNIFICAND_BITS"])) & config["MANTISSA_MASK"]
+  absx = xbits & 0x7FFFFFFFFFFFFFFF
+
+  if absx <= config["MINDENORM_O2"]: res = 0
+  elif absx > 0x7FF0000000000000: res = 0x7F if dtype == dtypes.fp8e4m3 else 0x7E | mantissa
+  elif absx > config["OVERFLOW_THRESHOLD"]:
+    if absx > DP_INF_BITS: sign = 0 # NaN converts to positive MAXNORM
+    res = config["MAXNORM"]
+  elif absx >= config["MINNORM"]:
+    res = ((exp << (config["SIGNIFICAND_BITS"] - 1)) | mantissa)
+    if rounding == RoundingMode.NEAREST:
+      round_bits = xbits & ((FP4_DP_HALF_ULP << 1) - 1)
+      if (round_bits > FP4_DP_HALF_ULP or ((round_bits == FP4_DP_HALF_ULP) and (mantissa & 1))): res += 1
+  else:
+    shift = 1 - exp
+    mantissa |= 1 << (config["SIGNIFICAND_BITS"] - 1)
+    res = (mantissa >> shift)
+    if rounding == RoundingMode.NEAREST:
+      round_bits = (xbits | (1 << (53 - 1))) & ((FP4_DP_HALF_ULP << (shift + 1)) - 1)
+      if (round_bits > (FP4_DP_HALF_ULP << shift)) or (round_bits == (FP4_DP_HALF_ULP << shift) and (res & 1)):
+        res = res + 1
+
+  res |= sign
+  return int(res)
+
+# TODO
+def fp4_to_float(x: int, dtype: DType) -> float:
+  assert dtype in dtypes.fp4s, "Only for fp4s"
+  ur = x << 4
+
+  if dtype == dtypes.fp8e5m2 and (ur & 0x7FFF) > 0x7C00: ur = 0x7FFF
+  elif dtype == dtypes.fp8e4m3:
+    sign = ur & 0x8000
+    exponent = ((ur & 0x7800) >> 1) + 0x2000
+    mantissa = (ur & 0x0700) >> 1
+    absx = x & 0x7F
+    if absx == 0x7F: ur = 0x7FFF
+    elif exponent == 0x2000:
+      if mantissa != 0:
+        mantissa <<= 1
+        while (mantissa & 0x0400) == 0:
+          mantissa <<= 1
+          exponent -= 0x0400
+        mantissa &= 0x03FF
+      else:
+        exponent = 0
+      ur = (sign | exponent) | mantissa
+    else:
+      ur = (sign | exponent) | mantissa
+
+  half_bytes = struct.pack('<H', ur)
+  float32_val = struct.unpack('e', half_bytes)[0]
+  return float(float32_val)
+  '''
+  s = (x >> 3) & 0x1
+  e = (x >> 1) & 0x3  # 2 exponent bits
+  m = x & 0x1         # 1 mantissa bit
+
+  # All-ones exponent -> NaN/Inf class. We map to NaN for consistency with fp8_to_float handling.
+  if e == 0b11:
+    return float('nan')
+
+  sign = -1.0 if s else 1.0
+  bias = 1
+
+  if e == 0:
+    # Zero or subnormal: with 1 mantissa bit, only 0 or 0.5 exist
+    if m == 0:
+      return -0.0 if s else 0.0
+    # subnormal: value = (-1)^s * 2^(1-bias) * (m / 2^mant_bits)
+    val = (m / 2.0) * (2.0 ** (1 - bias))
+    return sign * val
+  ur = x << 8
+
+  if dtype == dtypes.fp8e5m2 and (ur & 0x7FFF) > 0x7C00: ur = 0x7FFF
+  elif dtype == dtypes.fp8e4m3:
+    sign = ur & 0x8000
+    exponent = ((ur & 0x7800) >> 1) + 0x2000
+    mantissa = (ur & 0x0700) >> 1
+    absx = x & 0x7F
+    if absx == 0x7F: ur = 0x7FFF
+    elif exponent == 0x2000:
+      if mantissa != 0:
+        mantissa <<= 1
+        while (mantissa & 0x0400) == 0:
+          mantissa <<= 1
+          exponent -= 0x0400
+        mantissa &= 0x03FF
+  else:
+    # Normal number: value = (-1)^s * 2^(e-bias) * (1 + m/2)
+    exp = e - bias
+    frac = 1.0 + (m / 2.0)
+    return sign * (2.0 ** exp) * frac
+  '''
+
 truncate: dict[DType, Callable] = {dtypes.bool: bool,
   dtypes.float16: truncate_fp16, dtypes.bfloat16: truncate_bf16,
   **{fp8: (lambda x, dtype=fp8: fp8_to_float(float_to_fp8(x, dtype), dtype)) for fp8 in dtypes.fp8s},
+  **{fp4: (lambda x, dtype=fp4: fp4_to_float(float_to_fp4(x, dtype), dtype)) for fp4 in dtypes.fp4s},
   dtypes.float32: lambda x: ctypes.c_float(x).value, dtypes.float64: lambda x: ctypes.c_double(x).value,
   dtypes.uint8: lambda x: ctypes.c_uint8(x).value, dtypes.uint16: lambda x: ctypes.c_uint16(x).value,
   dtypes.uint32: lambda x: ctypes.c_uint32(x).value, dtypes.uint64: lambda x: ctypes.c_uint64(x).value,

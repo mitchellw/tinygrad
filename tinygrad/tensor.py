@@ -3,7 +3,7 @@ from __future__ import annotations
 import time, math, itertools, functools, struct, sys, inspect, pathlib, string, hashlib, weakref
 from contextlib import ContextDecorator
 from typing import Callable, ClassVar, Sequence, cast, get_args, Literal, SupportsIndex, ParamSpec, TypeVar, Generic
-from tinygrad.dtype import DType, DTypeLike, dtypes, ImageDType, ConstType, least_upper_float, least_upper_dtype, sum_acc_dtype, to_dtype, truncate
+from tinygrad.dtype import DType, DTypeLike, dtypes, ImageDType, ConstType, least_upper_float, least_upper_dtype, sum_acc_dtype, to_dtype, truncate, _to_torch_dtype
 from tinygrad.dtype import _from_np_dtype, _to_np_dtype
 from tinygrad.helpers import argfix, make_tuple, flatten, prod, all_int, round_up, merge_dicts, argsort, getenv, all_same, fully_flatten, dedup
 from tinygrad.helpers import IMAGE, WINO, Metadata, TRACEMETA, ceildiv, fetch, polyN, unwrap, DEBUG, is_numpy_ndarray, RANGEIFY
@@ -151,7 +151,7 @@ class Tensor(MathTrait):
       if dtype is None:
         if (d := fully_flatten(data)) and all(isinstance(s, bool) for s in d): dtype = dtypes.bool
         else: dtype = dtypes.default_int if d and all_int(d) else dtypes.default_float  # NOTE: this works because all_int([True, False]) is True
-      if dtype in [dtypes.bfloat16, *dtypes.fp8s]: data = Tensor(_frompy(data, dtypes.float32), device=device).cast(dtype).uop
+      if dtype in [dtypes.bfloat16, *dtypes.fp8s, *dtypes.fp4s]: data = Tensor(_frompy(data, dtypes.float32), device=device).cast(dtype).uop
       else: data = _frompy(data, dtype)
     elif is_numpy_ndarray(data):
       import numpy as np
@@ -2064,8 +2064,7 @@ class Tensor(MathTrait):
     return data[:16]
 
   def _softmax(self, axis, dtype:DTypeLike|None=None) -> tuple[Tensor, Tensor, Tensor]:
-    m = self - self.max(axis=axis, keepdim=True).detach()
-    if dtype is not None: m = m.cast(dtype)
+    m = self.cast(dtype if dtype is not None else self.dtype) - self.cast(dtype if dtype is not None else self.dtype).max(axis=axis, keepdim=True).detach()
     e = m.exp()
     return m, e, e.sum(axis=axis, keepdim=True)
 
@@ -2093,7 +2092,7 @@ class Tensor(MathTrait):
       _, e, ss = self.contiguous()._softmax(axis, dtype)
       return e.div(ss).fuse()
     _, e, ss = self._softmax(axis, dtype)
-    return e.div(ss)
+    return e.div(ss).cast(dtype if dtype is not None else self.dtype)
 
   def log_softmax(self, axis=-1, dtype:DTypeLike|None=None) -> Tensor:
     """
@@ -2229,7 +2228,7 @@ class Tensor(MathTrait):
     return self._inverse().argmax(axis=axis, keepdim=keepdim)
 
   @staticmethod
-  def einsum(formula:str, *operands:Tensor|Sequence[Tensor], dtype:DTypeLike|None=None) -> Tensor:
+  def einsum(formula:str, *operands:Tensor|Sequence[Tensor], math_dtype:DTypeLike|None=None) -> Tensor:
     """
     Sums the product of the elements of the input tensors according to a formula based on the Einstein summation convention.
 
@@ -2266,12 +2265,19 @@ class Tensor(MathTrait):
       # permute to the sorted letter order, then reshape/expand to create dimensions for the missing letters
       xs_.append(x.permute(order).reshape([val if letter in letters else 1 for letter,val in letter_val]).expand([val for _,val in letter_val]))
 
+    # choose compute dtype for multiply-accumulate to control numerical error
+    # - if dtype is provided, use it
+    # - else, use sum_acc_dtype of the promoted input dtype
+    orig_dtype = least_upper_dtype(*[t.dtype for t in xs_])
+    compute_dtype = to_dtype(math_dtype) if math_dtype is not None else sum_acc_dtype(orig_dtype)
+    xs_ = [t.cast(compute_dtype) for t in xs_]
+
     # ordinal encode the output alphabet
     rhs_order = argsort(argsort(list(output)))
 
     # sum over all axes that's not in the output, then permute to the output order
     return functools.reduce(lambda a,b:a*b, xs_) \
-      .sum(axis=[axis for axis,(letter,_) in enumerate(letter_val) if letter not in output], dtype=dtype).permute(rhs_order)
+      .sum(axis=[axis for axis,(letter,_) in enumerate(letter_val) if letter not in output], dtype=compute_dtype).permute(rhs_order).cast(orig_dtype)
 
   # ***** processing ops *****
 
@@ -2659,13 +2665,14 @@ class Tensor(MathTrait):
 
   @staticmethod
   def _tri(r:sint, c:sint, diagonal:int=0, **kwargs) -> Tensor:
-    assert isinstance(r, int) and isinstance(c, int), f"does not support symbolic, getting {r=}, {c=}"
-    if r == 0 or c == 0 or diagonal >= c: return Tensor.zeros(r,c,**kwargs)
-    if r+diagonal <= 0: return Tensor.ones(r,c,**kwargs)
-    s = r+c-1
+    s = smax(1, r + c - 1)
     # build a (s, s) upper triangle
-    t = Tensor.ones(s,s,**kwargs).pad((None,(0,s))).flatten().shrink(((0,s*(2*s-1)),)).reshape(s,-1).shrink((None,(0,s)))
-    return t[:r,-diagonal:c-diagonal] if diagonal <= 0 else t[diagonal:r+diagonal,:c]
+    t = Tensor.ones(s, s, **kwargs).pad((None, (0, s))).flatten().shrink(((0, s*(2*s-1)),)).reshape(s, -1).shrink((None, (0, s)))
+    # ensure slice window of size (r, c) fits by padding bottom/right as needed
+    d = smax(diagonal, -r + 1)
+    row_start, col_start = smax(d, 0), smax(-d, 0)
+    t = t.pad(((0, smax(0, row_start + r - s)), (0, smax(0, col_start + c - s))))
+    return t[row_start:row_start + r, col_start:col_start + c]
 
   def triu(self, diagonal:int=0) -> Tensor:
     """
@@ -3021,7 +3028,7 @@ class Tensor(MathTrait):
     # NOTE: if you write this as self.maximum(0) the gradient is wrong, passing through half when self is 0
     return (self>0).where(self, 0)
 
-  def sigmoid(self) -> Tensor:
+  def sigmoid(self, math_dtype:DTypeLike|None=None) -> Tensor:
     """
     Applies the Sigmoid function element-wise.
 
@@ -3031,7 +3038,7 @@ class Tensor(MathTrait):
     print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).sigmoid().numpy())
     ```
     """
-    return (1 + (self * (-1/math.log(2))).exp2()).reciprocal()
+    return (1 + (self.cast(math_dtype if math_dtype else self.dtype) * (-1/math.log(2))).exp2()).reciprocal().cast(self.dtype)
 
   def logsigmoid(self) -> Tensor:
     """

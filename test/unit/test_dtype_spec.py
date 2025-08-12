@@ -17,6 +17,7 @@ dtype_floats = [dt for dt in core_dtypes if dtypes.is_float(dt) and is_dtype_sup
 
 FP8E4M3_MAX = 448.0
 FP8E5M2_MAX = 57344.0
+FP4E2M1_MAX = 6.0
 
 def _assert_eq(tensor:Tensor, target_dtype:DType, target, tol_target_dtype:float=1e-7):
   if DEBUG >= 2: print(tensor.numpy())
@@ -56,6 +57,9 @@ class TestHelpers(unittest.TestCase):
   def test_fp8s_are_float(self):
     assert dtypes.is_float(dtypes.fp8e4m3)
     assert dtypes.is_float(dtypes.fp8e5m2)
+
+  def test_fp4s_are_float(self):
+    assert dtypes.is_float(dtypes.fp4e2m1)
 
   @given(strat.sampled_from([d for d in DTYPES_DICT.values() if dtypes.is_float(d) or dtypes.is_int(d)]), strat.integers(min_value=2, max_value=8))
   def test_scalar(self, dtype, amt):
@@ -127,6 +131,12 @@ class TestHelpers(unittest.TestCase):
     elif x < -FP8E5M2_MAX: np.testing.assert_equal(truncate[dtypes.fp8e5m2](x), -FP8E5M2_MAX)
     else: np.testing.assert_equal(truncate[dtypes.fp8e5m2](x), ml_dtypes.float8_e5m2(x))
 
+  @given(strat.floats(width=32, allow_subnormal=True, allow_nan=True, allow_infinity=True))
+  def test_truncate_fp4e2m1(self, x):
+    if x > FP4E2M1_MAX: np.testing.assert_equal(truncate[dtypes.fp4e2m1](x), FP4E2M1_MAX)
+    elif x < -FP4E2M1_MAX: np.testing.assert_equal(truncate[dtypes.fp4e2m1](x), -FP4E2M1_MAX)
+    else: np.testing.assert_equal(truncate[dtypes.fp4e2m1](x), ml_dtypes.float4_e2m1fn(x))
+
 class TestTypeSpec(unittest.TestCase):
   def setUp(self):
     self.old_default_int, self.old_default_float = dtypes.default_int, dtypes.default_float
@@ -138,7 +148,7 @@ class TestTypeSpec(unittest.TestCase):
       dtypes.default_int = default_int
       assert dtypes.default_int == default_int
 
-    for default_float in [*dtypes.fp8s, dtypes.float16, dtypes.bfloat16, dtypes.float32, dtypes.float64]:
+    for default_float in [*dtypes.fp4s, *dtypes.fp8s, dtypes.float16, dtypes.bfloat16, dtypes.float32, dtypes.float64]:
       dtypes.default_float = default_float
       assert dtypes.default_float == default_float
 
@@ -314,6 +324,9 @@ class TestTypePromotion(unittest.TestCase):
     assert least_upper_dtype(dtypes.float16, dtypes.int64) == dtypes.float16
     assert least_upper_dtype(dtypes.float16, dtypes.uint64) == dtypes.float16
     assert least_upper_dtype(dtypes.fp8e4m3, dtypes.fp8e5m2) == dtypes.half
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.fp8e4m3) == dtypes.fp8e4m3
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.fp8e5m2) == dtypes.fp8e5m2
+    assert least_upper_dtype(dtypes.fp4e2m1, dtypes.int8) == dtypes.float16
 
 class TestAutoCastType(unittest.TestCase):
   def setUp(self):
